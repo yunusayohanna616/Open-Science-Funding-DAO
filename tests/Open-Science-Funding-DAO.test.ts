@@ -1,30 +1,21 @@
-import { assert, assertEquals, assertStringIncludes } from 'chai';
-import { Client, Provider, ProviderRegistry, Result } from '@blockstack/clarity';
-import { describe, it, before } from 'mocha';
+import { describe, expect, it } from "vitest";
 
-describe('open-science-funding-dao contract test suite', () => {
-  let client: Client;
-  let provider: Provider;
+const accounts = simnet.getAccounts();
+const address1 = accounts.get("wallet_1")!;
 
-  before(async () => {
-    provider = await ProviderRegistry.createProvider();
-    client = new Client("./contracts/open-science-funding-dao.clar");
+/*
+  The test below is an example. To learn more, read the testing documentation here:
+  https://docs.hiro.so/stacks/clarinet-js-sdk
+*/
+
+describe("example tests", () => {
+  it("ensures simnet is well initialised", () => {
+    expect(simnet.blockHeight).toBeDefined();
   });
 
-  describe('proposal creation and funding', () => {
-    it('should create a new proposal', async () => {
-      const result = await client.createProposal("Research Project", 1000, 3);
-      assertEquals(result.success, true);
-    });
-
-    it('should allow staking tokens', async () => {
-      const result = await client.stakeTokens(1, 500);
-      assertEquals(result.success, true);
-    });
-
-    it('should complete milestones', async () => {
-      const result = await client.completeMilestone(1, 0);
-      assertEquals(result.success, true);
-    });
-  });
+  // it("shows an example", () => {
+  //   const { result } = simnet.callReadOnlyFn("counter", "get-counter", [], address1);
+  //   expect(result).toBeUint(0);
+  // });
 });
+

@@ -190,3 +190,324 @@
         (ok true)
     )
 )
+
+(define-constant ERR-ALREADY-VOTED (err u106))
+(define-constant ERR-VOTING-CLOSED (err u107))
+(define-constant VOTING-PERIOD u144)
+
+(define-map MilestoneVotes
+    {
+        proposal-id: uint,
+        milestone-id: uint,
+    }
+    {
+        yes-votes: uint,
+        no-votes: uint,
+        total-voters: uint,
+        voting-deadline: uint,
+        executed: bool,
+    }
+)
+
+(define-map VoterRecord
+    {
+        voter: principal,
+        proposal-id: uint,
+        milestone-id: uint,
+    }
+    { voted: bool }
+)
+
+(define-read-only (get-milestone-votes
+        (proposal-id uint)
+        (milestone-id uint)
+    )
+    (map-get? MilestoneVotes {
+        proposal-id: proposal-id,
+        milestone-id: milestone-id,
+    })
+)
+
+(define-read-only (has-voted
+        (voter principal)
+        (proposal-id uint)
+        (milestone-id uint)
+    )
+    (default-to false
+        (get voted
+            (map-get? VoterRecord {
+                voter: voter,
+                proposal-id: proposal-id,
+                milestone-id: milestone-id,
+            })
+        ))
+)
+
+(define-public (start-milestone-vote
+        (proposal-id uint)
+        (milestone-id uint)
+    )
+    (let (
+            (proposal (unwrap! (get-proposal proposal-id) ERR-PROPOSAL-NOT-FOUND))
+            (milestone (unwrap! (get-milestone proposal-id milestone-id)
+                ERR-MILESTONE-NOT-FOUND
+            ))
+        )
+        (asserts! (is-eq tx-sender (get researcher proposal)) ERR-NOT-AUTHORIZED)
+        (asserts! (is-eq (get status milestone) "PENDING") ERR-INVALID-STATUS)
+        (map-set MilestoneVotes {
+            proposal-id: proposal-id,
+            milestone-id: milestone-id,
+        } {
+            yes-votes: u0,
+            no-votes: u0,
+            total-voters: u0,
+            voting-deadline: (+ burn-block-height VOTING-PERIOD),
+            executed: false,
+        })
+        (ok true)
+    )
+)
+
+(define-public (vote-on-milestone
+        (proposal-id uint)
+        (milestone-id uint)
+        (vote-yes bool)
+    )
+    (let (
+            (staker-info (unwrap! (get-staker-info tx-sender proposal-id) ERR-NOT-AUTHORIZED))
+            (vote-data (unwrap! (get-milestone-votes proposal-id milestone-id)
+                ERR-MILESTONE-NOT-FOUND
+            ))
+            (stake-amount (get amount staker-info))
+        )
+        (asserts! (not (has-voted tx-sender proposal-id milestone-id))
+            ERR-ALREADY-VOTED
+        )
+        (asserts! (< burn-block-height (get voting-deadline vote-data))
+            ERR-VOTING-CLOSED
+        )
+        (map-set VoterRecord {
+            voter: tx-sender,
+            proposal-id: proposal-id,
+            milestone-id: milestone-id,
+        } { voted: true }
+        )
+        (map-set MilestoneVotes {
+            proposal-id: proposal-id,
+            milestone-id: milestone-id,
+        } {
+            yes-votes: (if vote-yes
+                (+ (get yes-votes vote-data) stake-amount)
+                (get yes-votes vote-data)
+            ),
+            no-votes: (if vote-yes
+                (get no-votes vote-data)
+                (+ (get no-votes vote-data) stake-amount)
+            ),
+            total-voters: (+ (get total-voters vote-data) u1),
+            voting-deadline: (get voting-deadline vote-data),
+            executed: (get executed vote-data),
+        })
+        (ok true)
+    )
+)
+
+(define-public (execute-milestone-vote
+        (proposal-id uint)
+        (milestone-id uint)
+    )
+    (let (
+            (proposal (unwrap! (get-proposal proposal-id) ERR-PROPOSAL-NOT-FOUND))
+            (milestone (unwrap! (get-milestone proposal-id milestone-id)
+                ERR-MILESTONE-NOT-FOUND
+            ))
+            (vote-data (unwrap! (get-milestone-votes proposal-id milestone-id)
+                ERR-MILESTONE-NOT-FOUND
+            ))
+        )
+        (asserts! (>= burn-block-height (get voting-deadline vote-data))
+            ERR-VOTING-CLOSED
+        )
+        (asserts! (not (get executed vote-data)) ERR-INVALID-STATUS)
+        (asserts! (> (get yes-votes vote-data) (get no-votes vote-data))
+            ERR-INVALID-STATUS
+        )
+        (try! (as-contract (stx-transfer? (get funding-amount milestone) tx-sender
+            (get researcher proposal)
+        )))
+        (map-set Milestones {
+            proposal-id: proposal-id,
+            milestone-id: milestone-id,
+        }
+            (merge milestone {
+                status: "COMPLETED",
+                completed-at: burn-block-height,
+            })
+        )
+        (map-set MilestoneVotes {
+            proposal-id: proposal-id,
+            milestone-id: milestone-id,
+        }
+            (merge vote-data { executed: true })
+        )
+        (ok true)
+    )
+)
+
+(define-map ResearcherReputation
+    { researcher: principal }
+    {
+        total-projects: uint,
+        completed-projects: uint,
+        total-milestones: uint,
+        completed-milestones: uint,
+        reputation-score: uint,
+        last-updated: uint,
+    }
+)
+
+(define-map ProjectOutcomes
+    { proposal-id: uint }
+    {
+        outcome-reported: bool,
+        success-rating: uint,
+        impact-score: uint,
+        peer-reviews: uint,
+    }
+)
+
+(define-read-only (get-researcher-reputation (researcher principal))
+    (default-to {
+        total-projects: u0,
+        completed-projects: u0,
+        total-milestones: u0,
+        completed-milestones: u0,
+        reputation-score: u0,
+        last-updated: u0,
+    }
+        (map-get? ResearcherReputation { researcher: researcher })
+    )
+)
+
+(define-read-only (get-project-outcome (proposal-id uint))
+    (map-get? ProjectOutcomes { proposal-id: proposal-id })
+)
+
+(define-read-only (calculate-reputation-score
+        (total-projects uint)
+        (completed-projects uint)
+        (total-milestones uint)
+        (completed-milestones uint)
+    )
+    (if (is-eq total-projects u0)
+        u0
+        (let (
+                (project-completion-rate (/ (* completed-projects u100) total-projects))
+                (milestone-completion-rate (if (is-eq total-milestones u0)
+                    u0
+                    (/ (* completed-milestones u100) total-milestones)
+                ))
+            )
+            (/ (+ project-completion-rate milestone-completion-rate) u2)
+        )
+    )
+)
+
+(define-private (update-researcher-reputation-on-milestone
+        (researcher principal)
+        (milestone-completed bool)
+    )
+    (let ((current-rep (get-researcher-reputation researcher)))
+        (map-set ResearcherReputation { researcher: researcher } {
+            total-projects: (get total-projects current-rep),
+            completed-projects: (get completed-projects current-rep),
+            total-milestones: (+ (get total-milestones current-rep) u1),
+            completed-milestones: (if milestone-completed
+                (+ (get completed-milestones current-rep) u1)
+                (get completed-milestones current-rep)
+            ),
+            reputation-score: (calculate-reputation-score (get total-projects current-rep)
+                (get completed-projects current-rep)
+                (+ (get total-milestones current-rep) u1)
+                (if milestone-completed
+                    (+ (get completed-milestones current-rep) u1)
+                    (get completed-milestones current-rep)
+                )),
+            last-updated: burn-block-height,
+        })
+    )
+)
+
+(define-private (update-researcher-reputation-on-project
+        (researcher principal)
+        (project-completed bool)
+    )
+    (let ((current-rep (get-researcher-reputation researcher)))
+        (map-set ResearcherReputation { researcher: researcher } {
+            total-projects: (+ (get total-projects current-rep) u1),
+            completed-projects: (if project-completed
+                (+ (get completed-projects current-rep) u1)
+                (get completed-projects current-rep)
+            ),
+            total-milestones: (get total-milestones current-rep),
+            completed-milestones: (get completed-milestones current-rep),
+            reputation-score: (calculate-reputation-score (+ (get total-projects current-rep) u1)
+                (if project-completed
+                    (+ (get completed-projects current-rep) u1)
+                    (get completed-projects current-rep)
+                )
+                (get total-milestones current-rep)
+                (get completed-milestones current-rep)
+            ),
+            last-updated: burn-block-height,
+        })
+    )
+)
+
+(define-public (report-project-outcome
+        (proposal-id uint)
+        (success-rating uint)
+        (impact-score uint)
+    )
+    (let ((proposal (unwrap! (get-proposal proposal-id) ERR-PROPOSAL-NOT-FOUND)))
+        (asserts! (is-eq tx-sender (get researcher proposal)) ERR-NOT-AUTHORIZED)
+        (asserts! (is-eq (get status proposal) "ACTIVE") ERR-INVALID-STATUS)
+        (asserts! (<= success-rating u10) ERR-INVALID-AMOUNT)
+        (asserts! (<= impact-score u10) ERR-INVALID-AMOUNT)
+        (map-set ProjectOutcomes { proposal-id: proposal-id } {
+            outcome-reported: true,
+            success-rating: success-rating,
+            impact-score: impact-score,
+            peer-reviews: u0,
+        })
+        (update-researcher-reputation-on-project (get researcher proposal)
+            (>= success-rating u7)
+        )
+        (map-set Proposals { proposal-id: proposal-id }
+            (merge proposal { status: "COMPLETED" })
+        )
+        (ok true)
+    )
+)
+
+(define-public (peer-review-project
+        (proposal-id uint)
+        (review-score uint)
+    )
+    (let (
+            (outcome (unwrap! (get-project-outcome proposal-id) ERR-PROPOSAL-NOT-FOUND))
+            (staker-info (unwrap! (get-staker-info tx-sender proposal-id) ERR-NOT-AUTHORIZED))
+        )
+        (asserts! (get outcome-reported outcome) ERR-INVALID-STATUS)
+        (asserts! (<= review-score u10) ERR-INVALID-AMOUNT)
+        (asserts! (> (get amount staker-info) u0) ERR-NOT-AUTHORIZED)
+        (map-set ProjectOutcomes { proposal-id: proposal-id }
+            (merge outcome {
+                peer-reviews: (+ (get peer-reviews outcome) u1),
+                impact-score: (/ (+ (get impact-score outcome) review-score) u2),
+            })
+        )
+        (ok true)
+    )
+)
