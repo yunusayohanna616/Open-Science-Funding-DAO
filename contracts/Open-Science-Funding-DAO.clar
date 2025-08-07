@@ -19,6 +19,7 @@
         status: (string-ascii 20),
         milestone-count: uint,
         created-at: uint,
+        funding-deadline: uint,
     }
 )
 
@@ -83,6 +84,7 @@
             status: "ACTIVE",
             milestone-count: milestone-count,
             created-at: burn-block-height,
+            funding-deadline: (+ burn-block-height DEFAULT-FUNDING-PERIOD),
         })
         (var-set proposal-count proposal-id)
         (ok proposal-id)
@@ -122,6 +124,9 @@
             (current-stake (default-to { amount: u0 } (get-staker-info tx-sender proposal-id)))
         )
         (asserts! (is-eq (get status proposal) "ACTIVE") ERR-INVALID-STATUS)
+        (asserts! (< burn-block-height (get funding-deadline proposal))
+            ERR-FUNDING-EXPIRED
+        )
         (asserts! (> amount u0) ERR-INVALID-AMOUNT)
         (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
         (map-set StakerInfo {
@@ -193,7 +198,9 @@
 
 (define-constant ERR-ALREADY-VOTED (err u106))
 (define-constant ERR-VOTING-CLOSED (err u107))
+(define-constant ERR-FUNDING-EXPIRED (err u108))
 (define-constant VOTING-PERIOD u144)
+(define-constant DEFAULT-FUNDING-PERIOD u1008)
 
 (define-map MilestoneVotes
     {
@@ -508,6 +515,47 @@
                 impact-score: (/ (+ (get impact-score outcome) review-score) u2),
             })
         )
+        (ok true)
+    )
+)
+
+(define-read-only (is-proposal-expired (proposal-id uint))
+    (match (get-proposal proposal-id)
+        proposal (>= burn-block-height (get funding-deadline proposal))
+        false
+    )
+)
+
+(define-public (expire-proposal (proposal-id uint))
+    (let ((proposal (unwrap! (get-proposal proposal-id) ERR-PROPOSAL-NOT-FOUND)))
+        (asserts! (>= burn-block-height (get funding-deadline proposal))
+            ERR-INVALID-STATUS
+        )
+        (asserts! (is-eq (get status proposal) "ACTIVE") ERR-INVALID-STATUS)
+        (map-set Proposals { proposal-id: proposal-id }
+            (merge proposal { status: "EXPIRED" })
+        )
+        (ok true)
+    )
+)
+
+(define-public (emergency-refund (proposal-id uint))
+    (let (
+            (proposal (unwrap! (get-proposal proposal-id) ERR-PROPOSAL-NOT-FOUND))
+            (staker-info (unwrap! (get-staker-info tx-sender proposal-id)
+                ERR-INSUFFICIENT-FUNDS
+            ))
+        )
+        (asserts! (>= burn-block-height (get funding-deadline proposal))
+            ERR-INVALID-STATUS
+        )
+        (asserts! (is-eq (get status proposal) "ACTIVE") ERR-INVALID-STATUS)
+        (try! (as-contract (stx-transfer? (get amount staker-info) tx-sender tx-sender)))
+        (map-delete StakerInfo {
+            staker: tx-sender,
+            proposal-id: proposal-id,
+        })
+        (var-set total-staked (- (var-get total-staked) (get amount staker-info)))
         (ok true)
     )
 )
