@@ -15,6 +15,12 @@
 (define-constant ERR-DISPUTE-NOT-FOUND (err u114))
 (define-constant ERR-DISPUTE-EXISTS (err u115))
 (define-constant ERR-DISPUTE-RESOLVED (err u116))
+(define-constant ERR-RESEARCHER-NOT-FOUND (err u117))
+(define-constant ERR-COLLABORATION-EXISTS (err u118))
+(define-constant ERR-COLLABORATION-NOT-FOUND (err u119))
+(define-constant ERR-INVALID-EXPERTISE (err u120))
+(define-constant ERR-COLLABORATION-ALREADY-ACCEPTED (err u121))
+(define-constant ERR-COLLABORATION-NOT-PENDING (err u122))
 
 (define-data-var dao-admin principal tx-sender)
 (define-data-var proposal-count uint u0)
@@ -25,6 +31,7 @@
 (define-data-var base-reward-rate uint u5)
 (define-data-var dispute-count uint u0)
 (define-data-var dispute-voting-period uint u288)
+(define-data-var collaboration-count uint u0)
 
 (define-map Proposals
     { proposal-id: uint }
@@ -171,6 +178,66 @@
     }
 )
 
+;; Research Collaboration Matching System Data Maps
+
+(define-map ResearcherExpertise
+    { researcher: principal }
+    {
+        expertise-areas: (list 5 (string-ascii 50)),
+        bio: (string-ascii 300),
+        contact-info: (string-ascii 100),
+        available-for-collaboration: bool,
+        expertise-count: uint,
+        updated-at: uint,
+    }
+)
+
+(define-map CollaborationRequests
+    { collaboration-id: uint }
+    {
+        requester: principal,
+        target-researcher: principal,
+        project-title: (string-ascii 100),
+        description: (string-ascii 400),
+        required-expertise: (list 3 (string-ascii 50)),
+        collaboration-type: (string-ascii 30),
+        status: (string-ascii 20),
+        created-at: uint,
+        expires-at: uint,
+        accepted-at: (optional uint),
+    }
+)
+
+(define-map ActiveCollaborations
+    {
+        collaboration-id: uint,
+        researcher-1: principal,
+        researcher-2: principal,
+    }
+    {
+        project-title: (string-ascii 100),
+        collaboration-type: (string-ascii 30),
+        started-at: uint,
+        status: (string-ascii 20),
+        completion-date: (optional uint),
+        outcome: (optional (string-ascii 200)),
+    }
+)
+
+(define-map CollaborationMatches
+    {
+        requester: principal,
+        match-id: uint,
+    }
+    {
+        potential-collaborator: principal,
+        expertise-match-score: uint,
+        availability-status: bool,
+        match-created-at: uint,
+        contacted: bool,
+    }
+)
+
 (define-read-only (get-proposal (proposal-id uint))
     (map-get? Proposals { proposal-id: proposal-id })
 )
@@ -297,6 +364,61 @@
         (dispute-id uint)
     )
     (is-some (get-dispute-vote voter dispute-id))
+)
+
+;; Research Collaboration Matching System Read-Only Functions
+
+(define-read-only (get-researcher-expertise (researcher principal))
+    (map-get? ResearcherExpertise { researcher: researcher })
+)
+
+(define-read-only (get-collaboration-request (collaboration-id uint))
+    (map-get? CollaborationRequests { collaboration-id: collaboration-id })
+)
+
+(define-read-only (get-active-collaboration
+        (collaboration-id uint)
+        (researcher-1 principal)
+        (researcher-2 principal)
+    )
+    (map-get? ActiveCollaborations {
+        collaboration-id: collaboration-id,
+        researcher-1: researcher-1,
+        researcher-2: researcher-2,
+    })
+)
+
+(define-read-only (get-collaboration-matches
+        (requester principal)
+        (match-id uint)
+    )
+    (map-get? CollaborationMatches {
+        requester: requester,
+        match-id: match-id,
+    })
+)
+
+(define-read-only (is-researcher-available (researcher principal))
+    (default-to false
+        (get available-for-collaboration
+            (get-researcher-expertise researcher)
+        )
+    )
+)
+
+(define-read-only (calculate-expertise-match
+        (required-areas (list 3 (string-ascii 50)))
+        (researcher-areas (list 5 (string-ascii 50)))
+    )
+    (let (
+            (matches (fold check-expertise-overlap required-areas u0))
+            (total-required (len required-areas))
+        )
+        (if (> total-required u0)
+            (/ (* matches u100) total-required)
+            u0
+        )
+    )
 )
 
 (define-public (create-proposal
@@ -767,6 +889,163 @@
     )
 )
 
+;; Research Collaboration Matching System Public Functions
+
+(define-public (register-expertise
+        (expertise-areas (list 5 (string-ascii 50)))
+        (bio (string-ascii 300))
+        (contact-info (string-ascii 100))
+        (available bool)
+    )
+    (begin
+        (asserts! (> (len expertise-areas) u0) ERR-INVALID-EXPERTISE)
+        (asserts! (> (len bio) u0) ERR-INVALID-AMOUNT)
+        (map-set ResearcherExpertise { researcher: tx-sender } {
+            expertise-areas: expertise-areas,
+            bio: bio,
+            contact-info: contact-info,
+            available-for-collaboration: available,
+            expertise-count: (len expertise-areas),
+            updated-at: stacks-block-height,
+        })
+        (ok true)
+    )
+)
+
+(define-public (create-collaboration-request
+        (target-researcher principal)
+        (project-title (string-ascii 100))
+        (description (string-ascii 400))
+        (required-expertise (list 3 (string-ascii 50)))
+        (collaboration-type (string-ascii 30))
+    )
+    (let ((collaboration-id (+ (var-get collaboration-count) u1)))
+        (asserts! (not (is-eq tx-sender target-researcher)) ERR-NOT-AUTHORIZED)
+        (asserts! (> (len project-title) u0) ERR-INVALID-AMOUNT)
+        (asserts! (> (len description) u0) ERR-INVALID-AMOUNT)
+        (asserts! (> (len required-expertise) u0) ERR-INVALID-EXPERTISE)
+        (asserts! (is-some (get-researcher-expertise target-researcher))
+            ERR-RESEARCHER-NOT-FOUND
+        )
+        (map-set CollaborationRequests { collaboration-id: collaboration-id } {
+            requester: tx-sender,
+            target-researcher: target-researcher,
+            project-title: project-title,
+            description: description,
+            required-expertise: required-expertise,
+            collaboration-type: collaboration-type,
+            status: "PENDING",
+            created-at: stacks-block-height,
+            expires-at: (+ stacks-block-height u1000),
+            accepted-at: none,
+        })
+        (var-set collaboration-count collaboration-id)
+        (ok collaboration-id)
+    )
+)
+
+(define-public (accept-collaboration (collaboration-id uint))
+    (let (
+            (request (unwrap! (get-collaboration-request collaboration-id)
+                ERR-COLLABORATION-NOT-FOUND
+            ))
+        )
+        (asserts! (is-eq tx-sender (get target-researcher request))
+            ERR-NOT-AUTHORIZED
+        )
+        (asserts! (is-eq (get status request) "PENDING")
+            ERR-COLLABORATION-NOT-PENDING
+        )
+        (asserts! (< stacks-block-height (get expires-at request))
+            ERR-VOTING-CLOSED
+        )
+        (map-set CollaborationRequests { collaboration-id: collaboration-id }
+            (merge request {
+                status: "ACCEPTED",
+                accepted-at: (some stacks-block-height),
+            })
+        )
+        (map-set ActiveCollaborations {
+            collaboration-id: collaboration-id,
+            researcher-1: (get requester request),
+            researcher-2: tx-sender,
+        } {
+            project-title: (get project-title request),
+            collaboration-type: (get collaboration-type request),
+            started-at: stacks-block-height,
+            status: "ACTIVE",
+            completion-date: none,
+            outcome: none,
+        })
+        (ok true)
+    )
+)
+
+(define-public (find-potential-collaborators
+        (required-expertise (list 3 (string-ascii 50)))
+        (collaboration-type (string-ascii 30))
+    )
+    (let ((match-id u1))
+        (asserts! (> (len required-expertise) u0) ERR-INVALID-EXPERTISE)
+        (asserts! (> (len collaboration-type) u0) ERR-INVALID-AMOUNT)
+        (ok match-id)
+    )
+)
+
+(define-public (complete-collaboration
+        (collaboration-id uint)
+        (researcher-1 principal)
+        (researcher-2 principal)
+        (outcome (string-ascii 200))
+    )
+    (let (
+            (collaboration (unwrap! (get-active-collaboration
+                collaboration-id
+                researcher-1
+                researcher-2
+            ) ERR-COLLABORATION-NOT-FOUND))
+        )
+        (asserts!
+            (or
+                (is-eq tx-sender researcher-1)
+                (is-eq tx-sender researcher-2)
+            )
+            ERR-NOT-AUTHORIZED
+        )
+        (asserts! (is-eq (get status collaboration) "ACTIVE")
+            ERR-INVALID-STATUS
+        )
+        (map-set ActiveCollaborations {
+            collaboration-id: collaboration-id,
+            researcher-1: researcher-1,
+            researcher-2: researcher-2,
+        }
+            (merge collaboration {
+                status: "COMPLETED",
+                completion-date: (some stacks-block-height),
+                outcome: (some outcome),
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-public (update-collaboration-availability (available bool))
+    (let (
+            (expertise (unwrap! (get-researcher-expertise tx-sender)
+                ERR-RESEARCHER-NOT-FOUND
+            ))
+        )
+        (map-set ResearcherExpertise { researcher: tx-sender }
+            (merge expertise {
+                available-for-collaboration: available,
+                updated-at: stacks-block-height,
+            })
+        )
+        (ok true)
+    )
+)
+
 (define-private (execute-dispute-resolution (dispute {
     disputer: principal,
     proposal-id: uint,
@@ -867,4 +1146,13 @@
         u0
         (/ (* completed u100) total)
     )
+)
+
+;; Research Collaboration Matching System Private Functions
+
+(define-private (check-expertise-overlap
+        (required-expertise (string-ascii 50))
+        (acc uint)
+    )
+    (+ acc u1)
 )
