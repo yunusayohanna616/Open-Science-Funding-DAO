@@ -21,6 +21,8 @@
 (define-constant ERR-INVALID-EXPERTISE (err u120))
 (define-constant ERR-COLLABORATION-ALREADY-ACCEPTED (err u121))
 (define-constant ERR-COLLABORATION-NOT-PENDING (err u122))
+(define-constant ERR-ALREADY-BOOKMARKED (err u123))
+(define-constant ERR-NOT-BOOKMARKED (err u124))
 
 (define-data-var dao-admin principal tx-sender)
 (define-data-var proposal-count uint u0)
@@ -43,6 +45,7 @@
         current-funding: uint,
         milestones-count: uint,
         status: (string-ascii 20),
+        watchers-count: uint,
         created-at: uint,
         category: (string-ascii 50),
     }
@@ -74,6 +77,14 @@
         amount: uint,
         funded-at: uint,
     }
+)
+
+(define-map ProposalBookmarks
+    {
+        user: principal,
+        proposal-id: uint,
+    }
+    { bookmarked: bool }
 )
 
 (define-map MilestoneVotes
@@ -262,6 +273,22 @@
     })
 )
 
+(define-read-only (is-proposal-bookmarked
+        (user principal)
+        (proposal-id uint)
+    )
+    (is-some (map-get? ProposalBookmarks {
+        user: user,
+        proposal-id: proposal-id,
+    }))
+)
+
+(define-read-only (get-proposal-watchers (proposal-id uint))
+    (let ((proposal (unwrap! (get-proposal proposal-id) ERR-PROPOSAL-NOT-FOUND)))
+        (ok (get watchers-count proposal))
+    )
+)
+
 (define-read-only (get-researcher-profile (researcher principal))
     (map-get? ResearcherProfile { researcher: researcher })
 )
@@ -400,9 +427,7 @@
 
 (define-read-only (is-researcher-available (researcher principal))
     (default-to false
-        (get available-for-collaboration
-            (get-researcher-expertise researcher)
-        )
+        (get available-for-collaboration (get-researcher-expertise researcher))
     )
 )
 
@@ -440,6 +465,7 @@
             current-funding: u0,
             milestones-count: milestones-count,
             status: "ACTIVE",
+            watchers-count: u0,
             created-at: stacks-block-height,
             category: category,
         })
@@ -477,6 +503,47 @@
         )
         (var-set total-staked (+ (var-get total-staked) amount))
         (initialize-staking-rewards tx-sender proposal-id amount)
+        (ok true)
+    )
+)
+
+(define-public (bookmark-proposal (proposal-id uint))
+    (let (
+            (proposal (unwrap! (get-proposal proposal-id) ERR-PROPOSAL-NOT-FOUND))
+            (existing (map-get? ProposalBookmarks {
+                user: tx-sender,
+                proposal-id: proposal-id,
+            }))
+        )
+        (asserts! (is-none existing) ERR-ALREADY-BOOKMARKED)
+        (map-set ProposalBookmarks {
+            user: tx-sender,
+            proposal-id: proposal-id,
+        } { bookmarked: true }
+        )
+        (map-set Proposals { proposal-id: proposal-id }
+            (merge proposal { watchers-count: (+ (get watchers-count proposal) u1) })
+        )
+        (ok true)
+    )
+)
+
+(define-public (unbookmark-proposal (proposal-id uint))
+    (let (
+            (proposal (unwrap! (get-proposal proposal-id) ERR-PROPOSAL-NOT-FOUND))
+            (existing (map-get? ProposalBookmarks {
+                user: tx-sender,
+                proposal-id: proposal-id,
+            }))
+        )
+        (asserts! (is-some existing) ERR-NOT-BOOKMARKED)
+        (map-delete ProposalBookmarks {
+            user: tx-sender,
+            proposal-id: proposal-id,
+        })
+        (map-set Proposals { proposal-id: proposal-id }
+            (merge proposal { watchers-count: (- (get watchers-count proposal) u1) })
+        )
         (ok true)
     )
 )
@@ -945,11 +1012,9 @@
 )
 
 (define-public (accept-collaboration (collaboration-id uint))
-    (let (
-            (request (unwrap! (get-collaboration-request collaboration-id)
-                ERR-COLLABORATION-NOT-FOUND
-            ))
-        )
+    (let ((request (unwrap! (get-collaboration-request collaboration-id)
+            ERR-COLLABORATION-NOT-FOUND
+        )))
         (asserts! (is-eq tx-sender (get target-researcher request))
             ERR-NOT-AUTHORIZED
         )
@@ -998,13 +1063,10 @@
         (researcher-2 principal)
         (outcome (string-ascii 200))
     )
-    (let (
-            (collaboration (unwrap! (get-active-collaboration
-                collaboration-id
-                researcher-1
-                researcher-2
-            ) ERR-COLLABORATION-NOT-FOUND))
-        )
+    (let ((collaboration (unwrap!
+            (get-active-collaboration collaboration-id researcher-1 researcher-2)
+            ERR-COLLABORATION-NOT-FOUND
+        )))
         (asserts!
             (or
                 (is-eq tx-sender researcher-1)
@@ -1012,9 +1074,7 @@
             )
             ERR-NOT-AUTHORIZED
         )
-        (asserts! (is-eq (get status collaboration) "ACTIVE")
-            ERR-INVALID-STATUS
-        )
+        (asserts! (is-eq (get status collaboration) "ACTIVE") ERR-INVALID-STATUS)
         (map-set ActiveCollaborations {
             collaboration-id: collaboration-id,
             researcher-1: researcher-1,
@@ -1031,11 +1091,7 @@
 )
 
 (define-public (update-collaboration-availability (available bool))
-    (let (
-            (expertise (unwrap! (get-researcher-expertise tx-sender)
-                ERR-RESEARCHER-NOT-FOUND
-            ))
-        )
+    (let ((expertise (unwrap! (get-researcher-expertise tx-sender) ERR-RESEARCHER-NOT-FOUND)))
         (map-set ResearcherExpertise { researcher: tx-sender }
             (merge expertise {
                 available-for-collaboration: available,
